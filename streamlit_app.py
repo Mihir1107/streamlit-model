@@ -1,4 +1,5 @@
 import time
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -7,12 +8,11 @@ import numpy as np
 import rasterio
 import streamlit as st
 import torch
+from matplotlib import cm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity as ssim
 from skimage.transform import resize
 
-from models.dual_edsr import DualEDSR
-from models.gan_sr import build_gan
-from models.swinir_guided import SwinIRConfig, build_model as build_swinir
+from models.dual_edsr import DualEDSR, DualEDSRPlus
 
 MODEL_PATH = Path("data_processed/best_model.pth")
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -22,7 +22,14 @@ def load_band(path, rescale=True, is_optical=False):
     """Load and optionally normalize a band or 3-channel optical stack."""
     with rasterio.open(path) as src:
         if is_optical:
-            band = src.read([1, 2, 3]).astype(np.float32)
+            if src.count >= 3:
+                band = src.read([1, 2, 3]).astype(np.float32)
+            else:
+                # Gracefully handle single/multi-band optical uploads by repeating the available bands.
+                band = src.read().astype(np.float32)
+                if band.ndim == 2:
+                    band = band[None, ...]
+                band = np.repeat(band[:1], 3, axis=0)
             if rescale:
                 for c in range(3):
                     mn, mx = band[c].min(), band[c].max()
@@ -37,31 +44,50 @@ def load_band(path, rescale=True, is_optical=False):
         return band
 
 
+def norm_np(a: np.ndarray) -> np.ndarray:
+    """Per-band min-max normalization to [0,1] with NaN/Inf protection."""
+    a = np.array(a, dtype=np.float32)
+    if np.isnan(a).any() or np.isinf(a).any():
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    mn = float(np.nanmin(a))
+    mx = float(np.nanmax(a))
+    if mx - mn < 1e-6:
+        return np.zeros_like(a, dtype=np.float32)
+    return ((a - mn) / (mx - mn)).astype(np.float32)
+
+
 def load_dual_edsr(weights_path: Path, device_str: str):
     device = torch.device(device_str)
-    model = DualEDSR().to(device)
     state_dict = torch.load(weights_path, map_location=device, weights_only=False)
-    model.load_state_dict(state_dict)
+    if isinstance(state_dict, dict):
+        if "model_state" in state_dict:
+            state_dict = state_dict["model_state"]
+        elif "model" in state_dict:
+            state_dict = state_dict["model"]
+    if any(k.startswith("module.") for k in state_dict):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    is_plus = any(k.startswith(("convT_in", "t_groups", "o_groups", "t_upsampler")) for k in state_dict)
+    if is_plus:
+        model = DualEDSRPlus(upscale=2).to(device)
+    else:
+        model = DualEDSR().to(device)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint mismatch for {'DualEDSRPlus' if is_plus else 'DualEDSR'} "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
     model.eval()
     return model
 
 
 def load_gan_gen(weights_path: Path, device_str: str):
-    device = torch.device(device_str)
-    gen, _ = build_gan()
-    state_dict = torch.load(weights_path, map_location=device, weights_only=False)
-    gen.load_state_dict(state_dict)
-    gen = gen.to(device)
-    gen.eval()
-    return gen
+    raise NotImplementedError("GAN loader removed")
 
 
 def load_swinir(weights_path: Path, device_str: str, upscale: int = 2):
-    device = torch.device(device_str)
-    cfg = SwinIRConfig(weight_path=weights_path, upscale=upscale, device=device_str)
-    model = build_swinir(cfg)
-    model.eval()
-    return model
+    raise NotImplementedError("SwinIR loader removed")
 
 
 MODEL_REGISTRY: Dict[str, Dict[str, object]] = {
@@ -70,15 +96,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, object]] = {
         "weights": MODEL_PATH,
         "notes": "Optical-guided EDSR baseline",
     },
-    "DualEDSR-GAN": {
-        "loader": load_gan_gen,
-        "weights": Path("checkpoints/gan_ssl4eo/gan_best.pth"),
-        "notes": "Newest GAN run (SSL4EO) stored under checkpoints/gan_ssl4eo",
-    },
-    "SwinIR-Guided": {
-        "loader": lambda w, d: load_swinir(w, d, upscale=2),
-        "weights": Path("checkpoints/swinir/ssl4eo_best_swinir.pth"),
-        "notes": "Guided SwinIR (simplified attention) using thermal+optical; weights in checkpoints/swinir",
+    "DualEDSR+": {
+        "loader": load_dual_edsr,
+        "weights": Path("hls_ssl/hls_ssl4eo_best.pth"),
+        "notes": "DualEDSRPlus (attention) fine-tuned on HLS/SSL4EO (thermal + optical)",
     },
 }
 
@@ -111,9 +132,22 @@ def compute_metrics(sr: np.ndarray, hr: Optional[np.ndarray]):
             anti_aliasing=True,
             preserve_range=True,
         )
+    sr_n = norm_np(sr)
+    hr_n = norm_np(hr)
+
+    mse = float(np.mean((sr_n - hr_n) ** 2))
+    if not np.isfinite(mse) or mse < 1e-12:
+        psnr_val = 100.0
+    else:
+        psnr_val = 10 * math.log10(1.0 / mse)
+    try:
+        ssim_val = float(ssim(hr_n, sr_n, data_range=1.0))
+    except Exception:
+        ssim_val = None
+
     return {
-        "psnr": float(peak_signal_noise_ratio(hr, sr, data_range=hr.max() - hr.min() + 1e-8)),
-        "ssim": float(ssim(hr, sr, data_range=hr.max() - hr.min() + 1e-8)),
+        "psnr": psnr_val,
+        "ssim": ssim_val,
     }
 
 
@@ -136,6 +170,21 @@ def contrast_stretch(img: np.ndarray, percentile: float):
     return np.clip((img - lo) / (hi - lo), 0, 1)
 
 
+def apply_colormap(img: np.ndarray, cmap_name: str):
+    """Map a single-channel image in [0,1] to RGB using a matplotlib colormap."""
+    cmap = cm.get_cmap(cmap_name)
+    rgb = cmap(np.clip(img, 0, 1))[..., :3]  # drop alpha
+    return rgb
+
+
+def render_thermal(img: np.ndarray, cmap_name: str, caption: str):
+    stretched = contrast_stretch(img, contrast)
+    if cmap_name == "gray":
+        st.image(stretched, clamp=True, use_column_width=True, caption=caption)
+    else:
+        st.image(apply_colormap(stretched, cmap_name), use_column_width=True, caption=caption)
+
+
 def select_device(preference: str):
     if preference == "GPU (if available)" and torch.cuda.is_available():
         return torch.device("cuda")
@@ -156,6 +205,8 @@ with st.sidebar:
     model_choices = list(MODEL_REGISTRY.keys())
     default_selection = model_choices[:2] if len(model_choices) >= 2 else model_choices
     selected_models = st.multiselect("Models to run", model_choices, default=default_selection)
+
+    colormap = st.selectbox("Thermal colormap", ["gray", "inferno", "magma", "plasma", "viridis"], index=1)
 
     st.header("Model Notes")
     for name in selected_models:
@@ -187,6 +238,7 @@ def resolve_paths():
 opt_path, thr_path, hr_path = resolve_paths()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 contrast = 1.0
+colormap = locals().get("colormap", "inferno")
 
 if not selected_models:
     st.warning("Select at least one model to run.")
@@ -199,7 +251,6 @@ else:
         hr_np = None
         if hr_path and hr_path.exists():
             hr_np = load_band(hr_path, rescale=True)
-        # Use proxy reference (input thermal) if no HR provided so PSNR/SSIM still display.
         ref_np = hr_np if hr_np is not None else thr_np
 
         results: List[Dict[str, object]] = []
@@ -216,46 +267,42 @@ else:
                 }
             )
 
-    tabs = st.tabs(["Inputs"] + [r["name"] for r in results])
+    # Overview bar
+    st.markdown("---")
+    info_cols = st.columns(3)
+    info_cols[0].metric("Models Selected", len(selected_models))
+    info_cols[1].metric("Device", str(device))
+    info_cols[2].metric("HR Reference", "Provided" if hr_np is not None else "Proxy (LR thermal)")
 
-    with tabs[0]:
-        st.subheader("Inputs")
-        if hr_np is None:
-            st.info("No HR thermal provided: PSNR/SSIM use the input thermal as a proxy reference.")
-        col1, col2 = st.columns(2)
-        with col1:
-            fig, ax = plt.subplots()
-            ax.imshow(np.transpose(opt_np, (1, 2, 0)))
-            ax.set_title("Optical (RGB)")
-            ax.axis("off")
-            st.pyplot(fig)
-        with col2:
-            fig, ax = plt.subplots()
-            ax.imshow(contrast_stretch(thr_np, contrast), cmap="gray")
-            ax.set_title("Thermal Input")
-            ax.axis("off")
-            st.pyplot(fig)
+    st.markdown("### 🖼 Multi-View Comparison")
+    for res in results:
+        st.markdown(f"#### {res['name']}")
+        row1 = st.columns(2)
+        with row1[0]:
+            st.markdown("**Optical (RGB)**")
+            st.image(np.transpose(opt_np, (1, 2, 0)), use_column_width=True)
+        with row1[1]:
+            st.markdown("**Thermal Input (LR)**")
+            render_thermal(thr_np, colormap, caption=None)
 
-    for idx, res in enumerate(results, start=1):
-        with tabs[idx]:
-            st.subheader(res["name"])
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                st.markdown("**Optical (RGB)**")
-                st.image(np.transpose(opt_np, (1, 2, 0)), use_column_width=True)
-            with col_b:
-                st.markdown("**Thermal Input**")
-                st.image(contrast_stretch(thr_np, contrast), clamp=True, use_column_width=True)
-            with col_c:
-                st.markdown("**Super-Resolved Thermal**")
-                st.image(contrast_stretch(res["sr"], contrast), clamp=True, use_column_width=True)
+        row2 = st.columns(2)
+        with row2[0]:
+            st.markdown("**Super-Resolved Thermal (SR)**")
+            render_thermal(res["sr"], colormap, caption=None)
+        with row2[1]:
+            st.markdown("**HR Thermal Reference**" if hr_np is not None else "**HR Thermal Reference (Not provided)**")
+            if hr_np is not None:
+                render_thermal(hr_np, colormap, caption=None)
+            else:
+                st.info("Upload HR thermal to compute true PSNR/SSIM.")
 
-            cols = st.columns(3)
-            cols[0].metric("Runtime (s)", f"{res['time']:.2f}")
-            cols[1].metric("PSNR", f"{res['psnr']:.2f}" if res["psnr"] is not None else "n/a")
-            cols[2].metric("SSIM", f"{res['ssim']:.3f}" if res["ssim"] is not None else "n/a")
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Runtime (s)", f"{res['time']:.2f}")
+        metric_cols[1].metric("PSNR", f"{res['psnr']:.2f}" if res["psnr"] is not None else "n/a")
+        metric_cols[2].metric("SSIM", f"{res['ssim']:.3f}" if res["ssim"] is not None else "n/a")
+        st.markdown("---")
 
-    st.subheader("Benchmark Table")
+    st.markdown("### 📊 Benchmark Table")
     table_rows = []
     for res in results:
         table_rows.append(
@@ -266,4 +313,4 @@ else:
                 "SSIM": None if res["ssim"] is None else round(res["ssim"], 3),
             }
         )
-    st.dataframe(table_rows, hide_index=True)
+    st.dataframe(table_rows, hide_index=True, use_container_width=True)
